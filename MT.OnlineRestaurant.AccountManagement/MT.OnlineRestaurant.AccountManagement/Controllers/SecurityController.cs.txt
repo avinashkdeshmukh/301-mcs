@@ -1,0 +1,149 @@
+﻿using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net.Http;
+using System.Threading.Tasks;
+using Microsoft.AspNetCore.Authentication;
+using Microsoft.AspNetCore.Authentication.Cookies;
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Identity;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.Extensions.Options;
+using MT.OnlineRestaurant.AccountManagement.Facebook;
+using MT.OnlineRestaurant.AccountManagement.Helpers;
+using MT.OnlineRestaurant.AccountManagement.Token;
+using MT.OnlineRestaurant.BusinessLayer.Interfaces;
+using MT.OnlineRestaurant.DataLayer.Context;
+using MT.OnlineRestaurant.Helper;
+using Newtonsoft.Json;
+
+namespace MT.OnlineRestaurant.AccountManagement.Controllers
+{
+    [Route("api/[controller]/[action]")]
+    public class SecurityController : Controller
+    {
+        private readonly UserManager<AppUser> _userManager;
+        private readonly IUserBusiness _userBusiness;
+        private readonly JwtOptions _jwtOptions;
+        private readonly IJwtFactory _jwtFactory;
+        private readonly AppSettings _appSettings;
+        private readonly FacebookCredentials _facebookCredentials;
+
+        public SecurityController(UserManager<AppUser> userManager,
+            IUserBusiness userBusiness,
+            IOptions<AppSettings> appSettings,
+            JwtOptions jwtOptions,
+            IOptions<FacebookCredentials> facebookCredentials,
+            IJwtFactory jwtFactory)
+        {
+            this._userManager = userManager;
+            _userBusiness = userBusiness;
+            this._jwtOptions = jwtOptions;
+            this._jwtFactory = jwtFactory;
+            _facebookCredentials = facebookCredentials.Value;
+            _appSettings = appSettings.Value;
+        }
+
+
+        // GET api/values/5
+        [HttpPost]
+        [AllowAnonymous]
+        public async Task<IActionResult> LoginAsync(string username, string password)
+        {
+
+
+            var user = _userBusiness.UserLogin(username, password);
+            if (user == null)
+                return BadRequest("Please enter valid username and password");
+            string tokenString = TokenGenerator.CreateToken(_appSettings.SecretKey, _appSettings.IssuerKey, user.Id, Convert.ToInt32(_appSettings.ExpiryTime));
+            return Ok(new
+            {
+                UserID = user.Id,
+                User = user.FirstName + user.LastName,
+                token = tokenString
+            });
+
+        }
+
+        [HttpPost]
+        [AllowAnonymous]
+        public async Task<IActionResult> GetToken(string username, string password)
+        {
+            TblCustomer user = new TblCustomer {
+                Id=001,
+                Email = username,
+                Password=password
+            };
+            if (user == null)
+                return BadRequest("Please enter valid username and password");
+            //string tokenString = TokenGenerator.CreateToken(_appSettings.SecretKey, _appSettings.IssuerKey, user.Id, Convert.ToInt32(_appSettings.ExpiryTime));
+            var claims = _jwtFactory.GetClaimsIdentity(username, user.Id.ToString());
+            string tokenString = await Tokens.GenerateJwt(claims, _jwtFactory, username, _jwtOptions, new JsonSerializerSettings { Formatting = Formatting.Indented });
+            return Ok(tokenString);
+        }
+
+        [HttpPost]
+        [AllowAnonymous]
+        public async Task<IActionResult> FacebookLoginAsync([FromBody] string accessToken)
+        {
+            HttpClient client = new HttpClient();
+            // 1.generate an app access token
+            var appAccessTokenResponse = await client.GetStringAsync($"https://graph.facebook.com/oauth/access_token?client_id={_facebookCredentials.AppId}&client_secret={_facebookCredentials.Secret}&grant_type=client_credentials");
+            var appAccessToken = JsonConvert.DeserializeObject<FacebookAppAccessToken>(appAccessTokenResponse);
+
+        // 2. validate the user access token
+        https://developers.facebook.com/tools/debug/accesstoken/?access_token=EAAicsGG2HusBAJQyhlCBDv6R2bwwzOMrHIfxBGHxeIw0UnX3aOhqJWaKUF8B4CyW2AnhU6HjpMaZBdLwzVeU8GZBuWr8xGbgqzCZBG5qmScdFo2zE8uh1AJXX8Qe7qzZBoIfTpnM0fVjCKypyEWAvEJ66KYZC8BIanarhcfdmQz8jRArZAX03YrKjncUmp7AUZD&version=v5.0
+            var userAccessTokenValidationResponse = await client.GetStringAsync($"https://graph.facebook.com/debug_token?input_token={accessToken}&access_token={appAccessToken.AccessToken}");
+            var userAccessTokenValidation = JsonConvert.DeserializeObject<FacebookUserAccessTokenValidation>(userAccessTokenValidationResponse);
+
+            if (!userAccessTokenValidation.Data.IsValid)
+            {
+                return BadRequest(Errors.AddErrorToModelState("login_failure", "Invalid facebook token.", ModelState));
+            }
+
+            // 3. we've got a valid token so we can request user data from fb
+            var userInfoResponse = await client.GetStringAsync($"https://graph.facebook.com/v2.8/me?fields=id,email,first_name,last_name,name,gender,locale,birthday,picture&access_token={accessToken}");
+            var userInfo = JsonConvert.DeserializeObject<FacebookUserData>(userInfoResponse);
+
+            // 4. ready to create the local user account (if necessary) and jwt
+            var user = await _userManager.FindByEmailAsync(userInfo.Email);
+
+            if (user == null)
+            {
+                var appUser = new AppUser
+                {
+                    FirstName = userInfo.FirstName,
+                    LastName = userInfo.LastName,
+                    FacebookId = userInfo.Id,
+                    Email = userInfo.Email,
+                    UserName = userInfo.Email,
+                    PictureUrl = userInfo.Picture.Data.Url
+                };
+
+                var result = await _userManager.CreateAsync(appUser, Convert.ToBase64String(Guid.NewGuid().ToByteArray()).Substring(0, 8));
+
+                if (!result.Succeeded)
+                {
+                    return new BadRequestObjectResult(Errors.AddErrorsToModelState(result, ModelState));
+                }
+
+                //await _appDbContext.Customers.AddAsync(new Customer { IdentityId = appUser.Id, Location = "", Locale = userInfo.Locale, Gender = userInfo.Gender });
+                //await _appDbContext.SaveChangesAsync();
+            }
+
+            // generate the jwt for the local user...
+            var localUser = await _userManager.FindByNameAsync(userInfo.Email);
+
+            if (localUser == null)
+            {
+                return BadRequest(Errors.AddErrorToModelState("login_failure", "Failed to create local user account.", ModelState));
+            }
+
+            var jwt = await Tokens.GenerateJwt(_jwtFactory.GetClaimsIdentity(localUser.UserName, localUser.Id), _jwtFactory, localUser.UserName, _jwtOptions, new JsonSerializerSettings { Formatting = Formatting.Indented });
+
+            return new OkObjectResult(jwt);
+        }
+
+    }
+
+}

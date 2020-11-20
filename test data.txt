@@ -1,0 +1,13 @@
+Place order
+{
+  "orderId": 0,
+  "restaurantId": 1,
+  "customerId": 1,
+  "orderMenuDetails": [
+    {
+      "menuId": 1,
+      "price": 10
+    }
+  ],
+  "deliveryAddress": "Uttarahalli"
+}
